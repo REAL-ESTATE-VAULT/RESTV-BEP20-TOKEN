@@ -2,6 +2,8 @@
 
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 
 library SafeMath {
     function add(uint256 a, uint256 b) internal pure returns (uint256) {
@@ -91,8 +93,21 @@ abstract contract Auth {
         return authorizations[adr];
     }
 
+    bool private _isRenouncingOwnership;
+
     function renounceOwnership() public virtual onlyOwner {
-        emit OwnershipTransferred(address(0));
+        require(!_isRenouncingOwnership, "Ownership renouncement in progress");
+        _isRenouncingOwnership = true;
+        
+        // Perform ownership renouncement
+        _internalRenounceOwnership();
+        
+        _isRenouncingOwnership = false;
+    }
+
+    function _internalRenounceOwnership() internal {
+        // Perform the ownership renouncement here
+        emit OwnershipTransferred(address(0)); // Emit event before changing ownership
         owner = address(0);
     }
 
@@ -164,7 +179,7 @@ interface IDividendDistributor {
     function process(uint256 gas) external;
 }
 
-contract DividendDistributor is IDividendDistributor {
+contract DividendDistributor is IDividendDistributor, ReentrancyGuard {
     using SafeMath for uint256;
 
     address _token;
@@ -258,35 +273,39 @@ contract DividendDistributor is IDividendDistributor {
     function process(uint256 gas) external override onlyToken {
         uint256 shareholderCount = shareholders.length;
 
-        if(shareholderCount == 0) { return; }
+        if (shareholderCount == 0) { return; }
 
         uint256 gasUsed = 0;
         uint256 gasLeft = gasleft();
 
         uint256 iterations = 0;
+        uint256 maxIterations = 500;  // Max Iterations to save gas 
 
-        while(gasUsed < gas && iterations < shareholderCount) {
-            if(currentIndex >= shareholderCount){
+        while (gasUsed < gas && iterations < shareholderCount && iterations < maxIterations) {
+            if (currentIndex >= shareholderCount) {
                 currentIndex = 0;
             }
 
-            if(shouldDistribute(shareholders[currentIndex])){
-                distributeDividend(shareholders[currentIndex]);
-            }
+        if (shouldDistribute(shareholders[currentIndex])) {
+            distributeDividend(shareholders[currentIndex]);
+        }
 
-            gasUsed = gasUsed.add(gasLeft.sub(gasleft()));
-            gasLeft = gasleft();
-            currentIndex++;
-            iterations++;
+        uint256 newGasLeft = gasleft();
+        gasUsed = gasUsed.add(gasLeft.sub(newGasLeft));
+        gasLeft = newGasLeft;
+
+        currentIndex++;
+        iterations++;
         }
     }
+
     
     function shouldDistribute(address shareholder) internal view returns (bool) {
         return shareholderClaims[shareholder] + minPeriod < block.timestamp
                 && getUnpaidEarnings(shareholder) > minDistribution;
     }
 
-    function distributeDividend(address shareholder) internal {
+    function distributeDividend(address shareholder) internal nonReentrant {
         if(shares[shareholder].amount == 0){ return; }
 
         uint256 amount = getUnpaidEarnings(shareholder);
@@ -299,8 +318,8 @@ contract DividendDistributor is IDividendDistributor {
         }
     }
     
-    function claimDividend() external {
-        distributeDividend(msg.sender);
+    function claimDividend() external nonReentrant {
+    distributeDividend(msg.sender);
     }
 
     function getUnpaidEarnings(address shareholder) public view returns (uint256) {
@@ -330,19 +349,19 @@ contract DividendDistributor is IDividendDistributor {
     }
 }
 
-contract REALESTATEVAULT is IBEP20, Auth {
+contract REALESTATEVAULT is IBEP20, Auth, ReentrancyGuard  {
     using SafeMath for uint256;
 
-    address WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
-    address DEAD = 0x000000000000000000000000000000000000dEaD;
-    address ZERO = 0x0000000000000000000000000000000000000000;
-    address DEV =  0x47679B7B066E11FfbAd15aaD770801ccD7746FE0;
+    address private  WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+    address private  DEAD = 0x000000000000000000000000000000000000dEaD;
+    address private  ZERO = 0x0000000000000000000000000000000000000000;
+    address private  DEV =  0x47679B7B066E11FfbAd15aaD770801ccD7746FE0;
 
     string constant _name = "REAL ESTATE VAULT";
     string constant _symbol = "RESTV";
     uint8 constant _decimals = 18;
 
-    uint256 _totalSupply = 10000000000 * 10**6 * 10**_decimals;
+    uint256 _totalSupply = 20000 * 10**6 * 10**_decimals; //10 billion
 
     uint256 public _maxTxAmount = _totalSupply;
     uint256 public _maxWalletToken = _totalSupply;
@@ -359,9 +378,9 @@ contract REALESTATEVAULT is IBEP20, Auth {
     mapping (address => bool) isTimelockExempt;
     mapping (address => bool) isDividendExempt;
 
-    uint256 public liquidityFee    = 2;
+    uint256 public liquidityFee    = 1;
     uint256 public reflectionFee   = 2;
-    uint256 public marketingFee    = 0;
+    uint256 public marketingFee    = 1;
     uint256 public devFee          = 1;
     uint256 public totalFee        = marketingFee + reflectionFee + liquidityFee + devFee;
     uint256 public feeDenominator  = 100;
@@ -384,7 +403,7 @@ contract REALESTATEVAULT is IBEP20, Auth {
     uint256 distributorGas = 500000;
 
     bool public buyCooldownEnabled = true;
-    uint8 public cooldownTimerInterval = 10;
+    uint8 public cooldownTimerInterval = 5; // User must wait at least 5 minutes to trade again 
     mapping (address => uint) private cooldownTimer;
 
     bool public swapEnabled = true;
@@ -578,52 +597,69 @@ contract REALESTATEVAULT is IBEP20, Auth {
     }
 
     function swapBack() internal swapping {
-        uint256 dynamicLiquidityFee = isOverLiquified(targetLiquidity, targetLiquidityDenominator) ? 0 : liquidityFee;
-        uint256 amountToLiquify = swapThreshold.mul(dynamicLiquidityFee).div(totalFee).div(2);
-        uint256 amountToSwap = swapThreshold.sub(amountToLiquify);
+    uint256 dynamicLiquidityFee = isOverLiquified(targetLiquidity, targetLiquidityDenominator) ? 0 : liquidityFee;
+    uint256 amountToLiquify = swapThreshold.mul(dynamicLiquidityFee).div(totalFee).div(2);
+    uint256 amountToSwap = swapThreshold.sub(amountToLiquify);
 
-        address[] memory path = new address[](2);
-        path[0] = address(this);
-        path[1] = WBNB;
+    // Get balance before swap
+    uint256 balanceBefore = balanceOf(address(this));
 
-        uint256 balanceBefore = address(this).balance;
+    // Perform swap
+    swapTokensForBNB(amountToSwap);
 
-        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            amountToSwap,
-            0,
-            path,
-            address(this),
-            block.timestamp
-        );
+    // Get BNB balance after swap
+    uint256 amountBNB = balanceOf(address(this)).sub(balanceBefore);
 
-        uint256 amountBNB = address(this).balance.sub(balanceBefore);
+    // Calculate fees
+    uint256 totalBNBFee = totalFee.sub(dynamicLiquidityFee.div(2));
+    uint256 amountBNBLiquidity = amountBNB.mul(dynamicLiquidityFee).div(totalBNBFee).div(2);
+    uint256 amountBNBReflection = amountBNB.mul(reflectionFee).div(totalBNBFee);
+    uint256 amountBNBMarketing = amountBNB.mul(marketingFee).div(totalBNBFee);
+    uint256 amountBNBDev = amountBNB.mul(devFee).div(totalBNBFee);
 
-        uint256 totalBNBFee = totalFee.sub(dynamicLiquidityFee.div(2));
-        
-        uint256 amountBNBLiquidity = amountBNB.mul(dynamicLiquidityFee).div(totalBNBFee).div(2);
-        uint256 amountBNBReflection = amountBNB.mul(reflectionFee).div(totalBNBFee);
-        uint256 amountBNBMarketing = amountBNB.mul(marketingFee).div(totalBNBFee);
-        uint256 amountBNBDev = amountBNB.mul(devFee).div(totalBNBFee);
+    // Distribute reflection fees
+    try distributor.deposit{value: amountBNBReflection}() {} catch {}
 
-        try distributor.deposit{value: amountBNBReflection}() {} catch {}
-        (bool tmpSuccess,) = payable(marketingFeeReceiver).call{value: amountBNBMarketing, gas: 30000}("");
-        (tmpSuccess,) = payable(devFeeReceiver).call{value: amountBNBDev, gas: 30000}("");
-        
-        // Supress warning msg
-        tmpSuccess = false;
+    // Transfer marketing fee
+    (bool marketingSuccess,) = payable(marketingFeeReceiver).call{value: amountBNBMarketing, gas: 30000}("");
+    require(marketingSuccess, "Failed to transfer marketing fee");
 
-        if(amountToLiquify > 0){
-            router.addLiquidityETH{value: amountBNBLiquidity}(
-                address(this),
-                amountToLiquify,
-                0,
-                0,
-                autoLiquidityReceiver,
-                block.timestamp
-            );
-            emit AutoLiquify(amountBNBLiquidity, amountToLiquify);
-        }
+    // Transfer dev fee
+    (bool devSuccess,) = payable(devFeeReceiver).call{value: amountBNBDev, gas: 30000}("");
+    require(devSuccess, "Failed to transfer dev fee");
+
+    // Add liquidity
+    if(amountToLiquify > 0){
+        addLiquidity(amountToLiquify, amountBNBLiquidity);
+        emit AutoLiquify(amountBNBLiquidity, amountToLiquify);
     }
+}
+
+function swapTokensForBNB(uint256 tokenAmount) private {
+    address[] memory path = new address[](2);
+    path[0] = address(this);
+    path[1] = WBNB;
+
+    router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+        tokenAmount,
+        0,
+        path,
+        address(this),
+        block.timestamp
+    );
+}
+
+function addLiquidity(uint256 tokenAmount, uint256 bnbAmount) private {
+    router.addLiquidityETH{value: bnbAmount}(
+        address(this),
+        tokenAmount,
+        0,
+        0,
+        autoLiquidityReceiver,
+        block.timestamp
+    );
+}
+
 
 
     function setIsDividendExempt(address holder, bool exempt) public authorized {
@@ -666,7 +702,7 @@ contract REALESTATEVAULT is IBEP20, Auth {
         devFee = 1;
         totalFee = _liquidityFee.add(_reflectionFee).add(_marketingFee).add(devFee);
         feeDenominator = _feeDenominator;
-        require(totalFee < feeDenominator/3, "Fees cannot be more than 33%");
+        require(totalFee < feeDenominator/4, "Fees cannot be more than 25%");
     }
 
     function setFeeReceivers(address _autoLiquidityReceiver, address _marketingFeeReceiver ) external authorized {
