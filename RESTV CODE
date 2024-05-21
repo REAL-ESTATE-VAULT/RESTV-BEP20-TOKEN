@@ -361,7 +361,7 @@ contract REALESTATEVAULT is IBEP20, Auth, ReentrancyGuard  {
     string constant _symbol = "RESTV";
     uint8 constant _decimals = 18;
 
-    uint256 _totalSupply = 20000 * 10**6 * 10**_decimals; //10 billion
+    uint256 _totalSupply = 20000 * 10**6 * 10**_decimals; //20 billion
 
     uint256 public _maxTxAmount = _totalSupply;
     uint256 public _maxWalletToken = _totalSupply;
